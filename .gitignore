@@ -1,0 +1,8 @@
+*~
+*.sw?
+/ebin/
+/deps/
+/.rebar/
+_build/
+rebar3
+doc/
