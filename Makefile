@@ -14,3 +14,6 @@ compile: rebar3
 
 publish: rebar3
 	$(REBAR) hex publish
+
+shell: compile
+	$(REBAR) shell --eval "application:ensure_all_started(birdler)." --config "birdler.config"
