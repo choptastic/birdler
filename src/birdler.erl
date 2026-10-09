@@ -153,14 +153,23 @@ int_send(0,APIKey,Prefix,From,To,Sub,_Text,_Html,_Options) ->
         {subject,Sub}
     ]);
 int_send(TryNum,_APIKey,Prefix,From,To,Subject,Text,Html,Options) when TryNum > 0 ->
-    URL = Prefix ++ "transmissions",
+    URL = Prefix ++ ?EMAIL_ENDPOINT,
     EncodedJson = make_json(From, To, Subject, Text, Html,Options),
     Body = iolist_to_binary(EncodedJson),
-    error_logger:info_msg("Sending: ~nAPI KEY: ~s~nURL: ~s~nMessage: ~s~n", [?API_KEY, URL, Body]),
 
-    Headers = [{authorization, "Bearer: " ++ ?API_KEY}],
+    Headers = [
+        {authorization, "Bearer " ++ ?API_KEY},
+        {content_type,"application/json"}
+    ],
+    IbrowseOptions = [
+        {content_type,"application/json"},
+        {ssl_options, [{verify, verify_none}]}
+    ],
+
+    error_logger:info_msg("Sending: ~nHeaders: ~p: ~s~nURL: ~s~nMessage: ~s~n", [Headers, URL, Body]),
+
     
-    case ibrowse:send_req(URL,Headers,post,Body,[{content_type,"application/json"}]) of
+    case ibrowse:send_req(URL,Headers,post,Body,IbrowseOptions) of
         {ok, _, _, Result} ->
             error_logger:info_msg("Sent: ~p~n",[Result]),
             do_nothing;
@@ -172,35 +181,41 @@ int_send(Server,Port,From,To,Subject,Text,Html,Options) ->
     int_send(5,Server,Port,From,To,Subject,Text,Html,Options).
 
 make_json(From, To, Subject, Text, Html, Options) ->
-    {_Options2, ReplyTo} = extract_reply_to(Options),
-    ReplyToOption = case ReplyTo of
-        undefined -> [];
-        _ -> [{reply_to, i2b(ReplyTo)}]
-    end,
-    HtmlOption = case Html of
-        [] -> [];
-        _ -> [{html, i2b(Html)}]
-    end,
+    {Options2, ReplyTo} = extract_option(reply_to, Options),
+    {_Options3, Category} = extract_option(category, Options2),
+    ReplyToOption = create_option(reply_to, ReplyTo),
+    HtmlOption = create_option(html, Html),
+    CategoryOption = create_option(category, Category),
     {FromName, FromEmail} = normalize_email_name(From),
     {ToName, ToEmail} = normalize_email_name(To),
-    Proplist = [
-        {content, [
-            {text, i2b(Text)},
-            {subject, i2b(Subject)},
-            {from, [{email, i2b(FromEmail)}, {name, i2b(FromName)}]}
-        ] ++ ReplyToOption ++ HtmlOption},
+    Proplist =
+    [
+        {text, i2b(Text)},
+        {subject, i2b(Subject)},
+        {from, [{email, i2b(FromEmail)}, {name, i2b(FromName)}]},
         {to, [
             [{email,i2b(ToEmail)},{name,i2b(ToName)}]
         ]},
-        {options, [{track_clicks, false}]}
-    ],
+        {track_clicks, false}
+    ] ++ ReplyToOption ++ HtmlOption ++ CategoryOption,
     jsx:encode(Proplist).
 
-extract_reply_to(Options) ->
-    lists:foldl(fun({K,V}, {OptAcc, ReplyTo}) ->
-        case normalized_header(K) == "replyto" of
+create_option(_Option, Value) when Value == <<>>;
+                                      Value == "";
+                                      Value == undefined ->
+    [];
+create_option(Option, Value) ->
+    [{Option, i2b(Value)}]. 
+
+extract_option(Opt, Options) ->
+    Opt2 = normalized_header(Opt),
+    extract_option_worker(Opt2, Options).
+
+extract_option_worker(OptName, Options) ->
+    lists:foldl(fun({K,V}, {OptAcc, FoundVal}) ->
+        case normalized_header(K) == OptName of
             true -> {OptAcc, V};
-            false -> {[{K,V}|OptAcc], ReplyTo}
+            false -> {[{K,V}|OptAcc], FoundVal}
         end
     end, {[], undefined}, Options).
 
@@ -232,5 +247,7 @@ fix_floating_linefeeds([10 | Text]) ->
 fix_floating_linefeeds([H | Text]) ->
     [H | fix_floating_linefeeds(Text)].
 
+i2b(A) when is_atom(A) ->
+    i2b(atom_to_list(A));
 i2b(IO) ->
     unicode:characters_to_binary(IO).
