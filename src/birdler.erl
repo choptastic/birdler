@@ -30,15 +30,16 @@
     email/1,
     email/4,
     email/5,
-    email/6
-%    sms/1,
-%    sms/4
+    email/6,
+    sms/1,
+    sms/3,
+    sms/4
 ]).
 
 -export([fix_floating_linefeeds/1]).
 
 -record(mail,{from,to,subject,text,html,options}).
--record(sms,{from, to, text}).
+-record(sms,{from, to, text, category}).
 -record(data,{queue}).
 
 get_env(Key, Default) ->
@@ -46,6 +47,28 @@ get_env(Key, Default) ->
         undefined -> Default;
         {ok, Val} -> Val
     end.
+
+sms(SMS = #{from:=From,
+            to:=To,
+            text:=Text}) ->
+    Category = maps:get(category, SMS, marketing),
+    Msg = #sms{
+        from=From,
+        to=To,
+        text=Text,
+        category=Category},
+    gen_server:call(?MODULE, {queue, Msg}).
+
+
+sms(From, To, Text) ->
+    sms(From, To, Text, marketing).
+
+sms(From, To, Text, Category) ->
+    sms(#{from=>From,
+          to=>To,
+          text=>Text,
+          category=>Category}).
+
 
 email(#{from:=From,
         to:=To,
@@ -97,8 +120,8 @@ terminate(_Reason,_Data) ->
 init(Data) ->
     {ok,Data#data{queue=queue:new()},?TIMEOUT}.
 
-handle_call({queue,Mail},_From,#data{queue=Queue} = Data) ->
-    NewQueue = queue:in(Mail,Queue),
+handle_call({queue,Msg},_From,#data{queue=Queue} = Data) ->
+    NewQueue = queue:in(Msg,Queue),
     NewLen = queue:len(NewQueue),
     {reply,{queued,NewLen},Data#data{queue=NewQueue},?TIMEOUT};
 handle_call(reset,_From,Data) ->
@@ -114,7 +137,7 @@ handle_call(stop,_From,Data) ->
 
 handle_info(timeout,#data{queue=Queue} = Data) ->
     NewQueue = case queue:out(Queue) of
-        {{value,Mail},NQ} ->
+        {{value,Mail=#mail{}},NQ} ->
             #mail{
                 from=From,
                 to=To,
@@ -125,9 +148,25 @@ handle_info(timeout,#data{queue=Queue} = Data) ->
             } = Mail,
             spawn(fun() ->
                 try
-                    int_send(?API_KEY,?API_PREFIX,From,To,Subject,Text,Html,Options)
+                    send_inner(email,?API_KEY,?API_PREFIX,From,To,Subject,Text,Html,Options)
                 catch E:T:S ->
-                    error_logger:error_msg("~p:~p~n~p~n",[E,T,S])
+                    logger:error("Email Error: ~p:~p~n~p~n",[E,T,S])
+                end
+            end),
+            NQ;
+        {{value,SMS=#sms{}},NQ} ->
+            #sms{
+                from=From,
+                to=To,
+                text=Text,
+                category=Category
+            } = SMS,
+            Options = [{category, Category}],
+            spawn(fun() ->
+                try
+                    send_inner(sms,?API_KEY,?API_PREFIX,From,To,"",Text,"",Options)
+                catch E:T:S ->
+                    logger:error("SMS Error: ~p:~p~n~p~n",[E,T,S])
                 end
             end),
             NQ;
@@ -142,45 +181,67 @@ handle_cast(_Msg, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%% Headers is a proplist of {header,value}
-int_send(0,APIKey,Prefix,From,To,Sub,_Text,_Html,_Options) ->
-    error_logger:error_report([
+send_inner(Type, APIKey, Prefix, From, To, Sub, Text, Html, Options) ->
+    send_inner(5, Type, APIKey, Prefix, From, To, Sub, Text, Html, Options).
+
+send_inner(0,Type,APIKey,Prefix,From,To,Sub,_Text,_Html,_Options) ->
+    logger:error([
         failed_send,
+        {send_type, Type},
         {api_key,APIKey},
         {prefix,Prefix},
         {from,From},
         {to,To},
         {subject,Sub}
     ]);
-int_send(TryNum,_APIKey,Prefix,From,To,Subject,Text,Html,Options) when TryNum > 0 ->
-    URL = Prefix ++ ?EMAIL_ENDPOINT,
-    EncodedJson = make_json(From, To, Subject, Text, Html,Options),
+send_inner(TryNum,Type,_APIKey,Prefix,From,To,Subject,Text,Html,Options) when TryNum > 0 ->
+    URL = Prefix ++ url(Type),
+    EncodedJson = make_json(Type, From, To, Subject, Text, Html, Options),
     Body = iolist_to_binary(EncodedJson),
+    Headers = auth_headers(),
+    IbrowseOptions = ibrowse_opts(),
 
-    Headers = [
-        {authorization, "Bearer " ++ ?API_KEY},
-        {content_type,"application/json"}
-    ],
-    IbrowseOptions = [
-        {content_type,"application/json"},
-        {ssl_options, [{verify, verify_none}]}
-    ],
-
-    error_logger:info_msg("Sending: ~nHeaders: ~p: ~s~nURL: ~s~nMessage: ~s~n", [Headers, URL, Body]),
-
+    logger:notice("Sending: ~nHeaders: ~p~nURL: ~s~nMessage: ~s~n", [Headers, URL, Body]),
     
     case ibrowse:send_req(URL,Headers,post,Body,IbrowseOptions) of
         {ok, _, _, Result} ->
-            error_logger:info_msg("Sent: ~p~n",[Result]),
+            case maybe_decode_json(Result) of
+                #{<<"error">> := Error} ->
+                    logger:error("Failed to send: ~p", [Error]);
+                Success ->
+                    logger:notice("Sent: ~p~n",[Success])
+            end,
             do_nothing;
         {error, Reason} ->
-            error_logger:info_msg("Error In Send: ~p~n",[Reason])
+            logger:error("Error Sending: ~p~n",[maybe_decode_json(Reason)])
     end.
 
-int_send(Server,Port,From,To,Subject,Text,Html,Options) ->
-    int_send(5,Server,Port,From,To,Subject,Text,Html,Options).
+maybe_decode_json(X) ->
+    try jsx:decode(i2b(X))
+    catch E:T:S ->
+        logger:warning("Inbvalid JSON: ~p:~p~n~p~n",[E,T,S]),
+        X
+    end.
 
-make_json(From, To, Subject, Text, Html, Options) ->
+url(email) ->
+    ?EMAIL_ENDPOINT;
+url(sms) ->
+    ?SMS_ENDPOINT.
+
+
+auth_headers() ->
+    [
+        {authorization, i2b(["Bearer ", ?API_KEY])},
+        {content_type,"application/json"}
+    ].
+
+ibrowse_opts() ->
+    [
+        {content_type,"application/json"},
+        {ssl_options, [{verify, verify_none}]}
+    ].
+
+make_json(email, From, To, Subject, Text, Html, Options) ->
     {Options2, ReplyTo} = extract_option(reply_to, Options),
     {_Options3, Category} = extract_option(category, Options2),
     ReplyToOption = create_option(reply_to, ReplyTo),
@@ -198,6 +259,16 @@ make_json(From, To, Subject, Text, Html, Options) ->
         ]},
         {track_clicks, false}
     ] ++ ReplyToOption ++ HtmlOption ++ CategoryOption,
+    jsx:encode(Proplist);
+make_json(sms, From, To, _Subject, Text, _Html, Options) ->
+    {_Options3, Category} = extract_option(category, Options),
+    CategoryOption = create_option(category, Category),
+    Proplist =
+    [
+        {text, i2b(Text)},
+        {from, i2b(From)},
+        {to, i2b(To)}
+    ] ++ CategoryOption,
     jsx:encode(Proplist).
 
 create_option(_Option, Value) when Value == <<>>;
@@ -213,7 +284,8 @@ extract_option(Opt, Options) ->
 
 extract_option_worker(OptName, Options) ->
     lists:foldl(fun({K,V}, {OptAcc, FoundVal}) ->
-        case normalized_header(K) == OptName of
+        NormHead = normalized_header(K),
+        case NormHead == OptName of
             true -> {OptAcc, V};
             false -> {[{K,V}|OptAcc], FoundVal}
         end
